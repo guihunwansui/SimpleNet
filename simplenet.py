@@ -96,6 +96,26 @@ class TBWrapper:
     def step(self):
         self.g_iter += 1
 
+class AdaptiveNoisePredictor(torch.nn.Module): 
+    """extension 1: predict the level of noise spatially"""
+    def __init__(self, input_channels=1536, hidden_dim=256):
+        super(AdaptiveNoisePredictor, self).__init__()
+        self.conv1 = torch.nn.Conv2d(input_channels, hidden_dim, kernel_size=1, bias=True)
+        self.relu = torch.nn.ReLU()
+        self.conv2 = torch.nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True)
+        self.sigmoid = torch.nn.Sigmoid()
+        
+        torch.nn.init.xavier_normal_(self.conv1.weight)
+        torch.nn.init.xavier_normal_(self.conv2.weight)
+        
+    def forward(self, x):
+        # x shape: [batch, channels, height, width]
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        sigma_map = self.sigmoid(x)  # output: [0,1]
+        return sigma_map
+
 class SimpleNet(torch.nn.Module):
     def __init__(self, device):
         """anomaly detection class."""
@@ -132,6 +152,25 @@ class SimpleNet(torch.nn.Module):
         **kwargs,
     ):
         pid = os.getpid()
+        
+        # add noise predictor
+        self.noise_predictor = AdaptiveNoisePredictor(
+            input_channels=self.target_embed_dimension,  # 1536
+            hidden_dim=256
+        )
+        self.noise_predictor.to(self.device)
+        
+        # add optimizer
+        self.noise_opt = torch.optim.AdamW(
+            self.noise_predictor.parameters(), 
+            lr=lr * 0.1,  # small lr
+            weight_decay=1e-5
+        )
+        
+        # noise parameters
+        self.sigma_min = 0.010
+        self.sigma_max = 0.030
+        
         def show_mem():
             return(psutil.Process(pid).memory_info())
 
@@ -396,7 +435,9 @@ class SimpleNet(torch.nn.Module):
             if 'discriminator' in state_dict:
                 self.discriminator.load_state_dict(state_dict['discriminator'])
                 if "pre_projection" in state_dict:
-                    self.pre_projection.load_state_dict(state_dict["pre_projection"])
+                    self.pre_projection.load_state_dict(state_dict["pre_projection"])                
+                if "noise_predictor" in state_dict: # add noise loading
+                    self.noise_predictor.load_state_dict(state_dict["noise_predictor"])
             else:
                 self.load_state_dict(state_dict, strict=False)
 
@@ -415,7 +456,12 @@ class SimpleNet(torch.nn.Module):
                 state_dict["pre_projection"] = OrderedDict({
                     k:v.detach().cpu() 
                     for k, v in self.pre_projection.state_dict().items()})
-
+            # add store noise predictor
+            state_dict["noise_predictor"] = OrderedDict({
+            k: v.detach().cpu()
+            for k, v in self.noise_predictor.state_dict().items()
+        })
+            
         best_record = None
         for i_mepoch in range(self.meta_epochs):
 
@@ -459,6 +505,7 @@ class SimpleNet(torch.nn.Module):
         if self.pre_proj > 0:
             self.pre_projection.train()
         self.discriminator.train()
+        self.noise_predictor.train() # add noise predictor
         # self.feature_enc.eval()
         # self.feature_dec.eval()
         i_iter = 0
@@ -475,6 +522,7 @@ class SimpleNet(torch.nn.Module):
                     if self.pre_proj > 0:
                         self.proj_opt.zero_grad()
                     # self.dec_opt.zero_grad()
+                    self.noise_opt.zero_grad()  # add noise trainer zero grad
 
                     i_iter += 1
                     img = data_item["image"]
@@ -484,13 +532,35 @@ class SimpleNet(torch.nn.Module):
                     else:
                         true_feats = self._embed(img, evaluation=False)[0]
                     
-                    noise_idxs = torch.randint(0, self.mix_noise, torch.Size([true_feats.shape[0]]))
-                    noise_one_hot = torch.nn.functional.one_hot(noise_idxs, num_classes=self.mix_noise).to(self.device) # (N, K)
-                    noise = torch.stack([
-                        torch.normal(0, self.noise_std * 1.1**(k), true_feats.shape)
-                        for k in range(self.mix_noise)], dim=1).to(self.device) # (N, K, C)
-                    noise = (noise * noise_one_hot.unsqueeze(-1)).sum(1)
-                    fake_feats = true_feats + noise
+                    # noise_idxs = torch.randint(0, self.mix_noise, torch.Size([true_feats.shape[0]]))
+                    # noise_one_hot = torch.nn.functional.one_hot(noise_idxs, num_classes=self.mix_noise).to(self.device) # (N, K)
+                    # noise = torch.stack([
+                    #     torch.normal(0, self.noise_std * 1.1**(k), true_feats.shape)
+                    #     for k in range(self.mix_noise)], dim=1).to(self.device) # (N, K, C)
+                    # noise = (noise * noise_one_hot.unsqueeze(-1)).sum(1)
+                    
+                    # modify as adaptive noise
+                    batch_size = img.shape[0]
+                    # [batch*784, 1536] -> [batch, 1536, 28, 28]
+                    true_feats_spatial = true_feats.reshape(
+                        batch_size, patch_shapes[0][0], patch_shapes[0][1], -1
+                    ).permute(0, 3, 1, 2)
+
+                    sigma_map = self.noise_predictor(true_feats_spatial)  # [batch, 1, 28, 28]
+                    
+                    # projection based on sigma range
+                    sigma_map = self.sigma_min + (self.sigma_max - self.sigma_min) * sigma_map
+                    
+                    # generate new noise
+                    noise_shape = true_feats_spatial.shape  # [batch, 1536, 28, 28]
+                    base_noise = torch.randn(noise_shape).to(self.device)
+                    adaptive_noise = base_noise * sigma_map  
+                    
+                    # [batch, 1536, 28, 28] -> [batch*784, 1536]
+                    adaptive_noise = adaptive_noise.permute(0, 2, 3, 1).reshape(-1, adaptive_noise.shape[1])
+                    true_feats_flat = true_feats_spatial.permute(0, 2, 3, 1).reshape(-1, true_feats_spatial.shape[1])
+                    fake_feats = true_feats_flat + adaptive_noise
+                    # fake_feats = true_feats + noise
 
                     scores = self.discriminator(torch.cat([true_feats, fake_feats]))
                     true_scores = scores[:len(true_feats)]
@@ -515,6 +585,7 @@ class SimpleNet(torch.nn.Module):
                     if self.train_backbone:
                         self.backbone_opt.step()
                     self.dsc_opt.step()
+                    self.noise_opt.step()
 
                     loss = loss.detach().cpu() 
                     all_loss.append(loss.item())
