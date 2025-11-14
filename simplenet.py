@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
+import torchvision.utils as vutils
 
 import common
 import metrics
@@ -238,6 +239,9 @@ class SimpleNet(torch.nn.Module):
             lr=lr * 0.1,  # small lr
             weight_decay=1e-5,
         )
+
+        # number of sigma snapshots to save per epoch
+        self._sigma_snapshot_max = 8
 
         # Discriminator
         self.auto_noise = [auto_noise, None]
@@ -557,6 +561,9 @@ class SimpleNet(torch.nn.Module):
         LOGGER.info(f"Training discriminator...")
         with tqdm.tqdm(total=self.gan_epochs) as pbar:
             for i_epoch in range(self.gan_epochs):
+                # per-epoch collection of sigma snapshots
+                epoch_sigma_snapshots = []
+
                 all_loss = []
                 all_p_true = []
                 all_p_fake = []
@@ -601,6 +608,68 @@ class SimpleNet(torch.nn.Module):
                     sigma_map = (
                         self.sigma_min + (self.sigma_max - self.sigma_min) * sigma_map
                     )
+
+                    # log sigma_map statistics to TensorBoard (mean/std/min/max + histogram)
+                    if getattr(self, "logger", None) is not None:
+                        try:
+                            sigma_cpu = sigma_map.detach().cpu()
+                            s_mean = float(sigma_cpu.mean().item())
+                            s_std = float(sigma_cpu.std().item())
+                            s_min = float(sigma_cpu.min().item())
+                            s_max = float(sigma_cpu.max().item())
+                            # scalar metrics
+                            self.logger.logger.add_scalar(
+                                "sigma/mean", s_mean, self.logger.g_iter
+                            )
+                            self.logger.logger.add_scalar(
+                                "sigma/std", s_std, self.logger.g_iter
+                            )
+                            self.logger.logger.add_scalar(
+                                "sigma/min", s_min, self.logger.g_iter
+                            )
+                            self.logger.logger.add_scalar(
+                                "sigma/max", s_max, self.logger.g_iter
+                            )
+                            # histogram of sigma map distribution
+                            try:
+                                self.logger.logger.add_histogram(
+                                    "sigma/map", sigma_cpu, self.logger.g_iter
+                                )
+                            except Exception:
+                                # histogram is optional; ignore failures in non-ideal TB backends
+                                pass
+                            # collect up to self._sigma_snapshot_max single-image sigma maps
+                            try:
+                                if (
+                                    len(epoch_sigma_snapshots)
+                                    < self._sigma_snapshot_max
+                                ):
+                                    # sigma_cpu shape: [batch, 1, H, W]
+                                    n_take = min(
+                                        sigma_cpu.shape[0],
+                                        self._sigma_snapshot_max
+                                        - len(epoch_sigma_snapshots),
+                                    )
+                                    for ii in range(n_take):
+                                        epoch_sigma_snapshots.append(
+                                            sigma_cpu[ii : ii + 1]
+                                        )
+                                # log batch images to TB (normalized)
+                                try:
+                                    vis = (sigma_cpu - self.sigma_min) / (
+                                        self.sigma_max - self.sigma_min
+                                    )
+                                    vis = vis.clamp(0.0, 1.0)
+                                    self.logger.logger.add_images(
+                                        "sigma/map_batch", vis, self.logger.g_iter
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        except Exception:
+                            # be defensive: do not break training if logging fails
+                            pass
 
                     # generate new noise
                     noise_shape = true_feats_spatial.shape  # [batch, 1536, 28, 28]
@@ -657,6 +726,36 @@ class SimpleNet(torch.nn.Module):
                 all_p_true = sum(all_p_true) / len(input_data)
                 all_p_fake = sum(all_p_fake) / len(input_data)
                 cur_lr = self.dsc_opt.state_dict()["param_groups"][0]["lr"]
+                # save epoch-level sigma snapshots to disk and to TB
+                try:
+                    if len(epoch_sigma_snapshots) > 0:
+                        save_tensor = torch.cat(
+                            epoch_sigma_snapshots, dim=0
+                        )  # [N,1,H,W]
+                        save_vis = (save_tensor - self.sigma_min) / (
+                            self.sigma_max - self.sigma_min
+                        )
+                        save_vis = save_vis.clamp(0.0, 1.0)
+                        save_path = os.path.join(
+                            self.ckpt_dir, f"sigma_epoch_{i_epoch}.png"
+                        )
+                        try:
+                            vutils.save_image(
+                                save_vis, save_path, nrow=4, normalize=False
+                            )
+                        except Exception:
+                            pass
+                        if getattr(self, "logger", None) is not None:
+                            try:
+                                self.logger.logger.add_image(
+                                    f"sigma/epoch_{i_epoch}",
+                                    save_vis,
+                                    self.logger.g_iter,
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 pbar_str = f"epoch:{i_epoch} loss:{round(all_loss, 5)} "
                 pbar_str += f"lr:{round(cur_lr, 6)}"
                 pbar_str += (
