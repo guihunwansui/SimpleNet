@@ -1,6 +1,6 @@
 datapath=/content/SimpleNet
 # datasets=('screw' 'pill' 'capsule' 'carpet' 'grid' 'tile' 'wood' 'zipper' 'cable' 'toothbrush' 'transistor' 'metal_nut' 'bottle' 'hazelnut' 'leather')
-datasets=('bottle')
+datasets=('screw')
 dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; done))
 
 python3 main.py \
